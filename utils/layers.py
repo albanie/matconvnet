@@ -6,12 +6,15 @@ from collections import OrderedDict
 from math import floor, ceil
 from operator import mul
 import numpy as np
+import pdb
 from numpy import array
 import scipy
 import scipy.io
 import scipy.misc
 import copy
 import collections
+
+import ipdb
 
 # Recent Caffes just pass a string as a type; this is used for legacy support
 layers_type = {}
@@ -45,6 +48,7 @@ layers_type[21] = 'softmax_loss'
 layers_type[22] = 'split'
 layers_type[23] = 'tanh'
 layers_type[24] = 'window_data'
+layers_type[33] = 'slice'
 layers_type[39] = 'deconvolution'
 layers_type[40] = 'crop'
 
@@ -260,7 +264,7 @@ class CaffeLRN(CaffeElementWise):
         self.local_size = local_size
         self.alpha = alpha
         self.beta = beta
-        self.norm_region = norm_region
+        
         self.kappa = kappa
 
         assert(norm_region == 'across_channels')
@@ -302,9 +306,16 @@ class CaffeSoftMaxLoss(CaffeElementWise):
     def __init__(self, name, inputs, outputs):
         super(CaffeSoftMaxLoss, self).__init__(name, inputs, outputs)
 
+    def reshape(self, model):
+        """
+        the loss produces a single scalar output
+        """
+        model.vars[self.outputs[0]].shape = [1,1,1,1]
+
     def toMatlab(self):
         mlayer = super(CaffeSoftMaxLoss, self).toMatlab()
-        mlayer['type'][0] = u'dagnn.SoftMaxLoss'
+        mlayer['type'][0] = u'dagnn.Loss'
+        mlayer['block'][0] = dictToMatlabStruct({'loss': 'softmaxlog'})
         return mlayer
 
     def toMatlabSimpleNN(self):
@@ -334,16 +345,18 @@ class CaffeDropout(CaffeElementWise):
         print "  c- ratio (dropout rate):", self.ratio
 
 class CaffeData(CaffeLayer):
-    def __init__(self, name, inputs, outputs):
+    def __init__(self, name, inputs, outputs, transform_param=[], batch_size=10):
         super(CaffeData, self).__init__(name, inputs, outputs)
+        self.transform_param = transform_param
+        self.batch_size = batch_size
 
     def reshape(self, model):
-        # todo: complete otehr cases
-        shape = [layer.transform_param.crop_size,
-                 layer.transform_param.crop_size,
-                 3,
-                 layer.batch_size]
-        model.vars[self.outputs[0]].shape = shape
+        if self.transform_param and self.batch_size:
+            shape = [self.transform_param.crop_size,
+                     self.transform_param.crop_size,
+                     3,
+                     self.batch_size]
+            model.vars[self.outputs[0]].shape = shape
 
     def toMatlab(self):
         return None
@@ -367,6 +380,11 @@ class CaffeConv(CaffeLayer):
 
         super(CaffeConv, self).__init__(name, inputs, outputs)
 
+        # if unset, use sensible defaults
+        if len(stride) == 0 : stride = [1,1]
+        if len(pad) == 0 : pad = [0,0,0,0]
+
+        # ensure consistent attribute format
         if len(kernel_size) == 1 : kernel_size = kernel_size * 2
         if len(stride) == 1 : stride = stride * 2
         if len(pad) == 1 : pad = pad * 4
@@ -881,6 +899,71 @@ class CaffeBatchNorm(CaffeLayer):
         mlayer['type'] = u'bnorm'
         mlayer['epsilon'] = self.eps
         return mlayer
+
+# --------------------------------------------------------------------
+#                                                               Slice
+# --------------------------------------------------------------------
+
+class CaffeSlice(CaffeLayer):
+    def __init__(self, name, inputs, outputs, slice_dim, slice_point):
+        super(CaffeSlice, self).__init__(name, inputs, outputs)
+        self.slice_dim = slice_dim
+        self.slice_point = slice_point
+
+    def transpose(self, model):
+        self.slice_dim = [2, 3, 1, 0][self.slice_dim]
+
+    def reshape(self, model):
+        sizes = [model.vars[x].shape for x in self.inputs]
+        assert len(sizes) == 1, 'a slice layer should have a single input'
+        assert self.slice_dim in [0,1], 'slciing can only occur along channels or batches'
+
+        # reset slice_dim to match mcn
+        insize = sizes[0]
+        slice_dim = [3,2][self.slice_dim]
+        outsizes = copy.deepcopy([insize]) * len(self.outputs)
+
+        # if a slice point list is defined, it should fit into the target
+        # slice dimension
+        #assert(max(self.slice_point) < insize[
+        remaining_juice = insize[slice_dim]
+        for i, outsize in enumerate(outsizes[:-1]): 
+            current_point = self.slice_point[i]
+            outsizes[i][slice_dim] = current_point
+
+        outsizes[-1][slice_dim] = insize[slice_dim] - current_point
+
+        for i in range(len(outsizes)):
+            model.vars[self.outputs[i]].shape = outsizes[i]
+
+        ##for outsize in outsizes:
+
+        ## this needs careful calculation
+        #osize = copy.deepcopy(sizes[0])
+        #osize[self.slice_dim] = 0
+        #for thisSize in sizes:
+        #    for i in range(len(thisSize)):
+        #        if self.slice_dim == i:
+        #            osize[i] = osize[i] + thisSize[i]
+        #        else:
+        #            if osize[i] != thisSize[i]:
+        #                print "Warning: slice layer: inconsistent input dimensions", sizes
+        #model.vars[self.outputs[0]].shape = osize
+
+    def display(self):
+        super(CaffeSlice, self).display()
+        print "  Slice Dim: ", self.slice_dim
+
+    def toMatlab(self):
+        mlayer = super(CaffeSlice, self).toMatlab()
+        mlayer['type'][0] = u'dagnn.Slice'
+        pdb.set_trace()
+        mlayer['block'][0] = dictToMatlabStruct({'dim': self.slice_dim,
+                                    'slicePoint': row(self.slice_point)})
+        return mlayer
+
+    def toMatlabSimpleNN(self):
+        raise ConversionError('Slice layers do not work in a SimpleNN network')
 
 # --------------------------------------------------------------------
 #                                                               Concat

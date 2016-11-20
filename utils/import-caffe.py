@@ -20,6 +20,16 @@ import scipy.misc
 import google.protobuf.text_format
 from ast import literal_eval as make_tuple
 from layers import *
+from os.path import join as pjoin
+
+from time import time
+_tstart_stack = []
+
+def tic():
+    _tstart_stack.append(time())
+
+def toc(fmt="Elapsed: %s s"):
+    print fmt % (time() - _tstart_stack.pop())
 
 # --------------------------------------------------------------------
 #                                                  Check NumPy version
@@ -192,6 +202,8 @@ elif args.caffe_variant == 'caffe_b590f1d':
   import proto.caffe_b590f1d_pb2 as caffe_pb2
 elif args.caffe_variant == 'caffe_fastrcnn':
   import proto.caffe_fastrcnn_pb2 as caffe_pb2
+elif args.caffe_variant == 'julie_caffe':
+  import proto.julie_caffe_pb2 as caffe_pb2
 elif args.caffe_variant == '?':
   print 'Supported variants: caffe, vgg-caffe, caffe-old, caffe_0115, caffe_6e3916, caffe_b590f1d, caffe_fastrcnn'
   sys.exit(0)
@@ -281,7 +293,7 @@ if args.average_image:
     blob=caffe_pb2.BlobProto()
     blob.MergeFromString(args.average_image.read())
     average_image = blobproto_to_array(blob).astype('float32')
-    average_image = np.squeeze(average_image,3)
+    verage_image = np.squeeze(average_image,3)
     if args.transpose and average_image is not None:
       average_image = average_image.transpose([1,0,2])
       average_image = average_image[:,:,: : -1] # to RGB
@@ -326,35 +338,43 @@ if args.class_names:
 # Caffe stores the network structure and data into two different files
 # We load them both and merge them into a single MATLAB structure
 
-net=caffe_pb2.NetParameter()
-data=caffe_pb2.NetParameter()
+net = caffe_pb2.NetParameter()
+data = caffe_pb2.NetParameter()
 
+tic()
 print 'Loading Caffe CNN structure from {}'.format(args.caffe_proto.name)
 google.protobuf.text_format.Merge(args.caffe_proto.read(), net)
+toc(fmt='loading proto: %.2f seconds')
 
+tic()
 if args.caffe_data:
   print 'Loading Caffe CNN parameters from {}'.format(args.caffe_data.name)
-  data.MergeFromString(args.caffe_data.read())
+  data.ParseFromString(args.caffe_data.read())
+toc(fmt='loading caffemodel weights: %.2f seconds')
 
 # --------------------------------------------------------------------
 #                                   Read layers in a CaffeModel object
 # --------------------------------------------------------------------
 
-if args.caffe_variant in ['caffe_b590f1d', 'caffe_fastrcnn']:
-  layers_list = net.layer
-  data_layers_list = data.layer
+# handle common caffe variants
+if net.layer:
+    layers_list = net.layer
 else:
-  layers_list = net.layers
-  data_layers_list = data.layers
+    layers_list = net.layers
+
+if data.layer:
+    data_layers_list = data.layer
+else:
+    data_layers_list = data.layers
 
 print 'Converting {} layers'.format(len(layers_list))
 
+tic()
 cmodel = CaffeModel()
 for layer in layers_list:
 
   # Depending on how old the proto-buf, the top and bottom parameters
   # are found at a different level than the others
-  top = layer.top
   bottom = layer.bottom
   if args.caffe_variant in ['vgg-caffe', 'caffe-old']:
     layer = layer.layer
@@ -365,6 +385,7 @@ for layer in layers_list:
   ltype = layer.type
   if not isinstance(ltype, basestring): ltype = layers_type[ltype]
   print 'Added layer \'{}\' ({})'.format(ltype, layer.name)
+  top = layer.top
 
   # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   if ltype in ['conv', 'deconvolution', 'Convolution', 'Deconvolution']:
@@ -503,12 +524,26 @@ for layer in layers_list:
 
   # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   elif ltype in ['data', 'Data']:
-    opts = getopts(layer, 'eltwise_param')
+    opts = getopts(layer, 'transform_param')
     operations = ['prod', 'sum', 'max']
-    clayer = CaffeData(layer.name, bottom, top,
-                       operation = operations[opts.operation],
-                       coeff = opts.coeff,
-                       stable_prod_grad = opts.stable_prod_grad)
+    kwargs = {}
+    kwargs['transform_param'] = opts
+    #if hasattr(opts, 'coeff'):
+    #    kwargs['coeff'] = opts.coeff 
+    #if hasattr(opts, 'operation'):
+    #    kwargs['operation'] = operations[opts.operation]
+    #if hasattr(opts, 'stable_prod_grad'):
+    #    kwargs['stable_prod_grad'] = opts.stable_prod_grad
+    #if hasattr(opts, 'transform_param'):
+    #ipdb.set_trace()
+    clayer = CaffeData(layer.name, bottom, top, **kwargs)
+
+  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  elif ltype in ['slice']:
+    opts = getopts(layer, 'slice_param')
+    clayer = CaffeSlice(layer.name, bottom, top,
+                       slice_dim=opts.slice_dim, 
+                       slice_point=opts.slice_point)
 
   # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   elif ltype in ['roipooling', 'ROIPooling']:
@@ -539,11 +574,14 @@ for layer in layers_list:
           blob = blobproto_to_array(blob).astype('float32')
           print '  + parameter \'%s\' <-- blob%s' % (clayer.params[i], blob.shape)
           clayer.setBlob(cmodel, i, blob)
+toc(fmt='creating the matconvnet layers took %.2f seconds')
+
 
 # --------------------------------------------------------------------
 #                                Get the size of the network variables
 # --------------------------------------------------------------------
 
+tic()
 # Get the sizes of the network inputs
 for i, inputVarName in enumerate(net.input):
   if hasattr(net, 'input_shape') and net.input_shape:
@@ -560,6 +598,7 @@ for i, inputVarName in enumerate(net.input):
 
   cmodel.vars[inputVarName].shape = shape
   print '  c- Input \'{}\' is {}'.format(inputVarName, shape)
+toc(fmt='computing the variable sizes took %.2f seconds')
 
 # --------------------------------------------------------------------
 #                                                             Sanitize
@@ -568,6 +607,7 @@ for i, inputVarName in enumerate(net.input):
 # Rename layers, parametrs, and variables if they contain symbols that
 # are incompatible with MatConvNet.
 
+tic()
 layerNames = cmodel.layers.keys()
 for name in layerNames:
   ename = escape(name)
@@ -597,7 +637,11 @@ for name in parNames:
 # differently.
 
 for layer in cmodel.layers.itervalues():
-  if len(layer.inputs[0]) >= 1 and \
+  print "checking layer: {} for in-place usage".format(layer.name)
+  # safety check for data layers with no inputs
+  if not layer.inputs or not layer.outputs:
+      continue
+  elif len(layer.inputs[0]) >= 1 and \
         len(layer.outputs[0]) >= 1 and \
         layer.inputs[0] == layer.outputs[0]:
     name = layer.inputs[0]
@@ -608,6 +652,8 @@ for layer in cmodel.layers.itervalues():
     cmodel.renameVar(name, ename, afterLayer=layer.name)
     layer.inputs[0] = name
     layer.outputs[0] = ename
+
+toc(fmt='sanitizing the network took %.2f seconds')
 
 # --------------------------------------------------------------------
 #                                                   Get variable sizes
@@ -762,7 +808,14 @@ cmodel.display()
 minputs = np.empty(shape=[0,], dtype=minputdt)
 
 # Determine the size of the inputs and input image (dataShape)
-for i, inputVarName in enumerate(net.input):
+
+# hardcode if not set by model
+if net.input:
+  inputs = net.input
+else:
+  inputs = cmodel.vars.keys()[0:2]
+
+for i, inputVarName in enumerate(inputs):
   shape = cmodel.vars[inputVarName].shape
   # add metadata
   minput = np.empty(shape=[1,], dtype=minputdt)
@@ -858,6 +911,9 @@ if args.output_format == 'dagnn':
           'meta': mmeta}
 
   for layer in cmodel.layers.itervalues():
+    # ignore the data layers
+    if 'data' in layer.name:
+        continue
     mnet['layers'] = np.append(mnet['layers'], layer.toMatlab(), axis=0)
 
   for param in cmodel.params.itervalues():
