@@ -29,10 +29,11 @@ end
 
 % run forward pass for fusion networks
 models = {'fusion-3', 'merged-4'} ; %
+outputVars = {'fc2_fusion', 'fc1_fusion'} ;
 for i = 1:numel(models)
     model = models{i} ;
     inputVar = 'data_RGBD' ;
-    outputVar = 'fc1_fusion' ;
+    outputVar = outputVars{i} ;
 
     % load model
     net = cnn_init('model', model) ;
@@ -50,7 +51,7 @@ for i = 1:numel(models)
     % run forward pass (saving the final layer)
     varIndex = net.getVarIndex(outputVar) ;
     net.vars(varIndex).precious = true ;
-    net.eval({inputVar, data, 'label', 1}) ;
+    net.eval({inputVar, data}) ;
 
     lastVar = net.vars(varIndex).value ;
     lastVarName = net.vars(varIndex).name ;
